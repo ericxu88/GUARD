@@ -169,6 +169,18 @@ def test_single_sample_batch_no_nan() -> None:
         assert torch.isfinite(v)
 
 
+def test_cov_drift_is_zero_when_welford_has_fewer_than_two_samples() -> None:
+    # Bug: covariance() returns zeros when n < 2, so ‖0·Σ⁻¹ − I‖_F = sqrt(D) — a large
+    # spurious drift signal on the very first call. Fix: guard returns 0 instead.
+    d = 6
+    det = EmbeddingDriftDetector(_baseline(torch.zeros(d), torch.eye(d, dtype=torch.float64)))
+    scores = det.compute(torch.empty(0), torch.randn(1, d, dtype=torch.float64)).scores
+    assert float(scores["embedding_cov_drift"]) == 0.0, (
+        f"expected 0, got {float(scores['embedding_cov_drift']):.4g} "
+        f"(was sqrt(D)={d**0.5:.4g} before fix)"
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Contract
 # --------------------------------------------------------------------------------------

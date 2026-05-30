@@ -56,12 +56,16 @@ class PageHinkley:
             cooldown=cfg.cooldown,
         )
 
-    def reset(self) -> None:
-        """Clear all accumulated state."""
+    def _reset_statistic(self) -> None:
+        """Reset the PH accumulator only; gate cooldown set on this alarm step is preserved."""
         self._n = 0
         self._x_mean = 0.0
         self._cum = 0.0
         self._cum_min = 0.0
+
+    def reset(self) -> None:
+        """Clear all accumulated state including the alert gate."""
+        self._reset_statistic()
         self._gate.reset()
 
     def update(self, x: float) -> ChangePointResult:
@@ -74,6 +78,7 @@ class PageHinkley:
 
         alarm = self._gate.update(statistic > self.threshold)
         if alarm:
-            # Reset so evidence must re-accumulate; this is what lets an alert clear.
-            self.reset()
+            # Only reset the accumulator — _gate already set its cooldown on this step;
+            # calling reset() would erase it before the next update() can honour it.
+            self._reset_statistic()
         return ChangePointResult(alarm=alarm, statistic=statistic)

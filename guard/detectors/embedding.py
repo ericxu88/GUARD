@@ -114,10 +114,15 @@ class EmbeddingDriftDetector:
         mean_shift = mahalanobis(self._welford.mean.unsqueeze(0), mu, precision).squeeze(0)
 
         # Covariance drift: ‖Σ_run·Σ_ref⁻¹ − I‖_F (scale-free, 0 when Σ_run == Σ_ref).
-        cov = self._welford.covariance()
-        d = cov.shape[0]
-        eye = torch.eye(d, device=z.device, dtype=z.dtype)
-        cov_drift = torch.linalg.norm(cov @ precision - eye)
+        # Guard n < 2: covariance() returns zeros when undefined, and ‖0·Σ⁻¹ − I‖_F = sqrt(D)
+        # — a spurious large signal. Report 0 instead until a valid estimate is available.
+        if self._welford.n >= 2:
+            cov = self._welford.covariance()
+            d = cov.shape[0]
+            eye = torch.eye(d, device=z.device, dtype=z.dtype)
+            cov_drift = torch.linalg.norm(cov @ precision - eye)
+        else:
+            cov_drift = torch.zeros((), device=z.device, dtype=z.dtype)
 
         return DetectorResult(
             scores={

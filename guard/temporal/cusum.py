@@ -10,6 +10,14 @@ amount by which the stream runs above a reference level plus a slack ``delta`` (
 mean of the stream so far (unsupervised, self-calibrating). An alarm fires when ``S_t``
 exceeds ``threshold`` (the CUSUM ``h``), subject to debounce/cooldown. O(1) state per step,
 deterministic given the input sequence.
+
+**One alarm per regime transition (target=None).** When the target is the running mean the
+detector fires once when the shift first accumulates enough evidence. After the alarm the
+statistic resets to 0, but the running mean continues to track the stream — so if the
+stream remains elevated the running mean converges to the new level and the CUSUM increments
+become non-positive again, producing no further alarms. This is by design: the unsupervised
+mode signals that a level change occurred; it does not sustain an alert during a plateau.
+For continuous alarming during a sustained shift, supply a fixed ``target``.
 """
 
 from __future__ import annotations
@@ -57,8 +65,17 @@ class Cusum:
             cooldown=cfg.cooldown,
         )
 
+    def _reset_statistic(self) -> None:
+        """Reset the CUSUM statistic only; running mean and gate cooldown are preserved.
+
+        Preserving the running mean means the detector re-evaluates future observations
+        relative to the history it has seen, not from a cold start. Gate cooldown set on
+        this alarm step is not erased (see ``update``).
+        """
+        self._s = 0.0
+
     def reset(self) -> None:
-        """Clear all accumulated state."""
+        """Clear all accumulated state including running mean and alert gate."""
         self._n = 0
         self._x_mean = 0.0
         self._s = 0.0
@@ -75,5 +92,7 @@ class Cusum:
 
         alarm = self._gate.update(statistic > self.threshold)
         if alarm:
-            self.reset()
+            # Only reset the statistic — _gate already set its cooldown on this step;
+            # calling reset() would erase it before the next update() can honour it.
+            self._reset_statistic()
         return ChangePointResult(alarm=alarm, statistic=statistic)

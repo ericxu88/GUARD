@@ -60,3 +60,9 @@ class Baseline:
             )
         if not torch.allclose(self.embed_precision, self.embed_precision.T, atol=1e-4):
             raise ValueError("embed_precision must be symmetric")
+        eigvals = torch.linalg.eigvalsh(self.embed_precision)
+        if not (eigvals > 0).all():
+            raise ValueError(
+                "embed_precision must be positive definite "
+                f"(min eigenvalue: {eigvals.min().item():.4g})"
+            )

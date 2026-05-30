@@ -41,6 +41,17 @@ def test_baseline_rejects_unnormalized_distribution() -> None:
         b.validate()
 
 
+def test_baseline_rejects_non_psd_precision() -> None:
+    # Bug: validate() checked symmetry but not PSD, so a matrix with a negative eigenvalue
+    # silently passed. mahalanobis() would then clamp negative squared distances to 0,
+    # making OOD samples appear perfectly in-distribution.
+    b = _tiny_baseline()
+    # Symmetric but not PD: subtract a large multiple of the identity.
+    b.embed_precision = torch.eye(4) - 2.0 * torch.ones(4, 4)  # eigenvalues include negative
+    with pytest.raises(ValueError, match="positive definite"):
+        b.validate()
+
+
 @pytest.mark.gpu
 def test_cuda_is_visible() -> None:
     # Placeholder for Phase-2 hardware tests. Auto-skipped on CPU-only machines.

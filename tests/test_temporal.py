@@ -168,3 +168,57 @@ def test_invalid_params_rejected() -> None:
         Cusum(threshold=-1.0)
     with pytest.raises(ValueError):
         AlertGate(debounce=0)
+
+
+# --------------------------------------------------------------------------------------
+# Regression tests for confirmed bugs
+# --------------------------------------------------------------------------------------
+def test_cooldown_honoured_through_page_hinkley() -> None:
+    # Bug: reset() called on alarm wiped the gate's _cooldown_left before the next step,
+    # making cooldown silently ignored. Fix: _reset_statistic() preserves gate cooldown.
+    # Use alternating 0/large values so PH running mean lags and statistic accumulates.
+    ph = PageHinkley(threshold=1.0, delta=0.0, cooldown=5)
+    alarm_fired = False
+    for i in range(200):
+        x = 0.0 if i % 2 == 0 else 8.0  # alternating; running mean lags → PH grows
+        if ph.update(x).alarm:
+            alarm_fired = True
+            # Immediately after alarm the gate should still have cooldown set,
+            # not wiped to 0 by the old buggy reset().
+            assert ph._gate._cooldown_left == 5, (
+                f"gate cooldown was wiped to {ph._gate._cooldown_left} "
+                f"(expected 5); cooldown is being erased by reset()"
+            )
+            break
+    assert alarm_fired, "alarm never fired — check threshold/stream calibration"
+
+
+def test_cooldown_honoured_through_cusum() -> None:
+    # Same bug in Cusum: reset() wiped gate cooldown immediately after it was set.
+    cs = Cusum(threshold=1.0, delta=0.0, cooldown=5, target=0.0)
+    alarm_fired = False
+    for _ in range(200):
+        if cs.update(5.0).alarm:  # fixed target=0 so large x accumulates S reliably
+            alarm_fired = True
+            assert cs._gate._cooldown_left == 5, (
+                f"gate cooldown was wiped to {cs._gate._cooldown_left} "
+                f"(expected 5); cooldown is being erased by reset()"
+            )
+            break
+    assert alarm_fired, "alarm never fired"
+
+
+def test_cusum_running_mean_preserved_across_alarm() -> None:
+    # Bug: reset() zeroed _n and _x_mean on alarm, losing the running mean.
+    # Fix: _reset_statistic() only resets _s; _x_mean and _n persist across alarms.
+    cs = Cusum(threshold=0.01, delta=0.0, target=None)
+    # Build a running mean near 0 over 100 stationary steps.
+    for _ in range(100):
+        cs.update(0.0)
+    assert abs(cs._x_mean) < 0.01
+    assert cs._n == 100
+    # Inject a large spike to trigger an alarm.
+    cs.update(10.0)
+    # After alarm: _n and _x_mean must NOT be zeroed.
+    assert cs._n > 0, "_n was reset to 0 on alarm (running mean lost)"
+    assert abs(cs._x_mean) < 2.0, f"_x_mean was reset to near-0 on alarm; got {cs._x_mean}"
