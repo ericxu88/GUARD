@@ -4,10 +4,6 @@ GPU-native, unsupervised anomaly & runtime drift monitor for ML inference. Detec
 (entropy, KL/JS divergence, embedding drift) run **on the GPU, concurrently with
 inference** via a low-priority CUDA stream, for near-zero monitoring overhead.
 
-- **Architecture & full design:** [`docs/GUARD_design.md`](docs/GUARD_design.md)
-- **Agent/contributor rules:** [`CLAUDE.md`](CLAUDE.md) — read first
-- **Current work:** [`docs/PHASE_1_PLAN.md`](docs/PHASE_1_PLAN.md)
-
 ## Status
 
 Phase 1 — detectors, baselines, temporal change-point tests, config, export scaffolding.
