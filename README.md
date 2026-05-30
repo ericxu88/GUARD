@@ -19,7 +19,11 @@ Phase-1 progress (see [`docs/PHASE_1_PLAN.md`](docs/PHASE_1_PLAN.md) for the ful
 - ✅ **P1-04** KL/JS divergence detector (`guard/detectors/divergence.py`)
 - ✅ **P1-05** embedding-drift detector — Mahalanobis + streaming Welford (`guard/detectors/embedding.py`)
 - ✅ **P1-06** temporal change-point tests — Page-Hinkley & CUSUM (`guard/temporal/`)
-- ⬜ **P1-07..P1-09** baseline builder, drift-injection harness, Prometheus export
+- ✅ **P1-07** baseline builder — regularised covariance inversion, full stat computation (`guard/baseline/compute.py`)
+- ✅ **P1-08** drift-injection integration harness — clean → gradual → abrupt → recovery (`tests/test_drift_injection.py`)
+- ✅ **P1-09** Prometheus export scaffolding — metric registry + `update()` entry point (`guard/export/prometheus.py`)
+
+**Phase 1 complete.** All 130 CPU tests pass (`pytest -m "not gpu"`). Phase 2 (CUDA stream overlap engine, ring buffer, memory-safety stress) requires hardware with compute capability ≥ 8.0.
 
 ## Setup
 
