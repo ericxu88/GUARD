@@ -13,6 +13,7 @@ Phase-2 note: the overlap engine will add an optional zero-copy variant that wri
 into a pre-allocated summary buffer. The `DetectorResult` return path defined here is the
 stable v1 contract; do not change its shape without updating the engine and all callers.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
