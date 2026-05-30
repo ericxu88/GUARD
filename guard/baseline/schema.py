@@ -46,7 +46,11 @@ class Baseline:
             raise ValueError(
                 f"class_distribution must be [{c}], got {tuple(self.class_distribution.shape)}"
             )
-        if not torch.isclose(self.class_distribution.sum(), torch.tensor(1.0), atol=1e-4):
+        if not torch.isclose(
+            self.class_distribution.sum(),
+            torch.ones((), dtype=self.class_distribution.dtype),
+            atol=1e-4,
+        ):
             raise ValueError("class_distribution must sum to 1")
         if (self.class_distribution < 0).any():
             raise ValueError("class_distribution must be non-negative")
