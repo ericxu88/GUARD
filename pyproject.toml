@@ -54,6 +54,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# Detector docstrings/comments use mathematical notation (−, ×, ℝ, σ, Σ, μ, ⁻¹). Allow
+# ambiguous-unicode in *prose* (RUF002 docstrings, RUF003 comments); RUF001 still guards
+# against look-alike characters in actual code.
+ignore = ["RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.11"

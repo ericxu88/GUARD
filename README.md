@@ -10,6 +10,17 @@ Phase 1 — detectors, baselines, temporal change-point tests, config, export sc
 All Phase-1 work is **CPU-testable** (no GPU required). The Phase-2 stream-overlap engine
 and memory-safety tests require CUDA hardware (compute capability ≥ 8.0).
 
+Phase-1 progress (see [`docs/PHASE_1_PLAN.md`](docs/PHASE_1_PLAN.md) for the full tracker):
+
+- ✅ **P1-00** CI (ruff + mypy + `pytest -m "not gpu"`, opt-in GPU job)
+- ✅ **P1-01** config schema (`guard/config.py`)
+- ✅ **P1-02** versioned, checksummed baseline store (`guard/baseline/store.py`)
+- ✅ **P1-03** entropy detector (`guard/detectors/entropy.py`)
+- ✅ **P1-04** KL/JS divergence detector (`guard/detectors/divergence.py`)
+- ✅ **P1-05** embedding-drift detector — Mahalanobis + streaming Welford (`guard/detectors/embedding.py`)
+- ✅ **P1-06** temporal change-point tests — Page-Hinkley & CUSUM (`guard/temporal/`)
+- ⬜ **P1-07..P1-09** baseline builder, drift-injection harness, Prometheus export
+
 ## Setup
 
 ```bash
