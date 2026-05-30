@@ -4,6 +4,7 @@ This is what makes the whole Phase-1 suite runnable in CPU-only CI while still l
 GPU runner execute the Phase-2 overlap/memory tests. Mark hardware-dependent tests with
 `@pytest.mark.gpu`.
 """
+
 from __future__ import annotations
 
 import pytest
