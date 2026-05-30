@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "guard-monitor"
+version = "0.1.0"
+description = "GPU-native unsupervised anomaly & runtime drift monitor for ML inference"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+# NOTE: pin `torch` to the EXACT build your serving cluster uses. CUDA stream and caching
+# allocator behavior (record_stream, stream priorities) is version-sensitive — a mismatch
+# between dev and prod is how Phase-2 memory bugs hide. >=2.5 is a floor, not a target.
+dependencies = [
+    "torch>=2.5",
+    "numpy>=1.26",
+    "pydantic>=2.7",       # config + baseline schema validation
+    "pyyaml>=6.0",         # config files
+    "prometheus-client>=0.20",
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+]
+
+[project.optional-dependencies]
+# Reference/demo target (ViT-B/16). Swap if you change the monitored model.
+demo = [
+    "torchvision>=0.20",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "hypothesis>=6.100",   # property-based tests for detectors
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["guard"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device (skipped automatically when none is present)",
+    "slow: long-running benchmarks / soak tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+# torch's stubs are partial; relax just for the import boundary, not for our code.
+[[tool.mypy.overrides]]
+module = ["torch.*", "torchvision.*", "prometheus_client.*"]
+ignore_missing_imports = true
