@@ -56,6 +56,19 @@ class Baseline:
             raise ValueError("class_distribution must be non-negative")
         if self.entropy_bin_edges.numel() != self.entropy_histogram.numel() + 1:
             raise ValueError("entropy_bin_edges must have one more element than entropy_histogram")
+        if (self.entropy_histogram < 0).any():
+            raise ValueError("entropy_histogram must be non-negative")
+        # An empty histogram is not merely useless, it is actively misleading: the entropy
+        # detector normalizes it into an all-zero reference, against which every live batch
+        # scores a total-variation distance of exactly 0.5 forever. That is a plausible
+        # mid-range number, which is far worse than an obvious failure — so reject it here,
+        # where a bad baseline can still be caught at build/save/load time.
+        if float(self.entropy_histogram.sum()) <= 0.0:
+            raise ValueError(
+                "entropy_histogram is empty (sums to 0); it would make entropy_pop_shift a "
+                "constant 0.5. Rebuild the baseline over data that produced entropy values "
+                "inside [0, log C]."
+            )
         if self.embed_mean.shape != (d,):
             raise ValueError(f"embed_mean must be [{d}], got {tuple(self.embed_mean.shape)}")
         if self.embed_precision.shape != (d, d):
@@ -64,7 +77,12 @@ class Baseline:
             )
         if not torch.allclose(self.embed_precision, self.embed_precision.T, atol=1e-4):
             raise ValueError("embed_precision must be symmetric")
-        eigvals = torch.linalg.eigvalsh(self.embed_precision)
+        # eigvalsh has no half-precision kernel; check in float32 so a legitimately
+        # half-precision baseline is validated rather than dying on NotImplementedError.
+        precision = self.embed_precision
+        if precision.dtype in (torch.float16, torch.bfloat16):
+            precision = precision.float()
+        eigvals = torch.linalg.eigvalsh(precision)
         if not (eigvals > 0).all():
             raise ValueError(
                 "embed_precision must be positive definite "

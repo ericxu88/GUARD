@@ -1,0 +1,79 @@
+# GUARD runtime configuration.
+#
+# Everything here is validated at load time (guard/config.py); an unknown key or an
+# out-of-range value fails loudly at startup rather than silently disabling monitoring.
+
+# Global kill-switch. The GUARD_DISABLED=1 environment variable overrides this to off,
+# so an operator can neutralise monitoring in a running deployment without a code change.
+enabled: true
+
+# Steps per aggregation window. Each window contributes ONE value to each change-point
+# test. Larger windows mean smoother signals and fewer false positives, at the cost of
+# detection lag: expect to notice a shift after roughly window_size x debounce steps.
+window_size: 32
+
+# Steps per device->host copy of the scalar summary block. This is the only transfer
+# GUARD makes, and it is asynchronous. Larger = fewer, bigger copies and staler metrics.
+drain_every_k: 32
+
+detectors:
+  # Confidence collapse: the earliest signal, and the cheapest.
+  - name: entropy
+    enabled: true
+    params:
+      quantile: 0.99          # the tail statistic to report alongside the mean
+
+  # Prior / label shift: the predicted-class mix moving away from the baseline.
+  - name: divergence
+    enabled: true
+
+  # Covariate shift in the penultimate embedding space.
+  - name: embedding
+    enabled: true
+    params:
+      # ||Sigma_run . Sigma_ref^-1 - I||_F is an O(D^3) matmul — at D=768 that is
+      # comparable to a whole transformer layer. Recompute it every N steps instead of
+      # every batch; the underlying statistic is cumulative and barely moves in between.
+      cov_every: 32
+
+# Change-point tests, keyed by METRIC name (not detector name). A metric with no entry
+# here is exported to Prometheus but never pages anyone — the right default for
+# diagnostic signals you want on a dashboard but not on a rota.
+#
+# Two knobs with DIFFERENT units, and mixing them up is the most common calibration
+# mistake:
+#   `delta`     is in the metric's own units — the per-step slack the stream is allowed
+#               before the test starts accumulating evidence. Derive it from your clean
+#               traffic's spread (roughly the p99.9 of the metric, above its mean).
+#   `threshold` bounds the test's CUMULATIVE statistic, not the metric. Derive it from the
+#               peak statistic your clean traffic actually produces, with headroom.
+# So you cannot set `threshold` to "the p99.9 of the metric" — they are not the same
+# quantity. docs/RUNBOOK.md §1 has a runnable calibration script. The values below are
+# illustrative defaults, not universal ones.
+thresholds:
+  js_divergence:
+    method: page_hinkley
+    threshold: 0.05
+    delta: 0.002
+    debounce: 3               # consecutive flagged windows before an alert fires
+    cooldown: 20              # windows of silence after a firing, to stop alert storms
+
+  entropy_mean:
+    method: page_hinkley
+    threshold: 2.0
+    delta: 0.05
+    debounce: 3
+    cooldown: 20
+
+  embedding_mahalanobis_mean:
+    method: cusum
+    threshold: 8.0
+    delta: 0.5
+    debounce: 2
+    cooldown: 20
+
+export:
+  enabled: true
+  prometheus_port: 9300
+  namespace: guard
+  push_gateway_url: null      # set for batch/offline jobs that are never scraped

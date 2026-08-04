@@ -12,17 +12,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # CPU job: the full Phase-1 suite runs here. No CUDA required.
+  # CPU job: the whole suite except the hardware tests. No CUDA required, because the
+  # engine's stream/event facade degrades to no-ops off CUDA — which is what makes ring
+  # indexing, drain batching, backpressure and failure isolation testable here.
   cpu:
     name: lint + types + tests (CPU)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -46,10 +52,46 @@ jobs:
         # gpu-marked tests auto-skip without CUDA (see conftest.py).
         run: pytest -m "not gpu"
 
-  # GPU job: full suite incl. overlap/memory tests. Opt-in; needs a self-hosted
-  # CUDA runner (compute capability >= 8.0). Skipped unless that runner is online.
+      - name: End-to-end example
+        # The quickstart exercises the whole product surface — build a baseline, persist it,
+        # attach the monitor, inject drift, clear on recovery, scrape Prometheus. If the
+        # public API regresses, this breaks even when the unit tests do not.
+        run: python examples/quickstart.py
+
+      - name: Benchmark harness smoke test
+        # Not a performance gate (a shared CPU runner cannot measure one); this only proves
+        # the harness itself still runs, so the GPU job is not the first place it breaks.
+        run: |
+          python benchmarks/ab_latency.py --batch 4 --iters 16 --blocks 2 --warmup 4 \
+            --num-classes 50 --embed-dim 64 --depth 1 --slo 100000
+
+  build:
+    name: package builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - name: Check the wheel contains every subpackage
+        run: |
+          python - <<'EOF'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          for pkg in ("engine", "detectors", "baseline", "temporal", "export", "safety", "integration"):
+              assert any(n.startswith(f"guard/{pkg}/") for n in names), f"missing guard/{pkg}"
+          print(wheel, "ok")
+          EOF
+
+  # GPU job: the hardware tests plus the overhead SLO. Opt-in — it needs a self-hosted
+  # CUDA runner (compute capability >= 8.0), so it is not wired to push/PR. See
+  # docs/GPU_VERIFICATION.md for the full manual procedure including the Nsight capture,
+  # which is not automatable.
   gpu:
-    name: full suite (GPU)
+    name: hardware tests + overhead SLO (GPU)
     runs-on: [self-hosted, gpu]
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
@@ -61,7 +103,27 @@ jobs:
           python-version: "3.11"
 
       - name: Install (dev extras)
+        # No --extra-index-url here: the runner must supply the exact torch+CUDA build the
+        # serving cluster uses. record_stream semantics are version-sensitive.
         run: python -m pip install -e ".[dev]"
+
+      - name: Report device
+        run: python -c "import torch; print(torch.__version__, torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))"
 
       - name: Pytest (full, incl. GPU)
         run: pytest
+
+      - name: A/B overhead SLO
+        # Exits non-zero when p99 overhead or throughput drop exceeds 2%.
+        run: python benchmarks/ab_latency.py --batch 32 --iters 500 --json ab.json
+
+      - name: Saturation sweep
+        run: python benchmarks/saturation.py --batches 1,4,16,64 --json sweep.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guard-gpu-benchmarks
+          path: |
+            ab.json
+            sweep.json

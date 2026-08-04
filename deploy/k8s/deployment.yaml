@@ -1,0 +1,351 @@
+# GUARD reference Kubernetes manifests.
+#
+# THESE ARE REFERENCE MANIFESTS. They have not been applied to a cluster in CI. Treat them
+# as the shape of a correct deployment, not as a verified artifact.
+#
+# GUARD is a library that runs IN-PROCESS with the inference server (design doc §13): it
+# needs the same CUDA context and the live output tensors. There is no GUARD pod, no GUARD
+# sidecar, and no GUARD service on the request path. What follows is therefore a *serving*
+# Deployment that happens to have GUARD linked into it, exposing one extra port for
+# Prometheus to scrape.
+#
+# Replace, at minimum: the image, the model/baseline versions, the resource numbers, the
+# node selector/tolerations, and the storage class. Every one of those is site-specific.
+#
+# Files here:
+#   ConfigMap             guard-config      — guard.yaml, mounted read-only
+#   PersistentVolumeClaim guard-baselines   — the baseline artifact bundle
+#   Deployment            model-server      — the serving pod, GUARD linked in
+#
+# The Service and ServiceMonitor live in deploy/k8s/servicemonitor.yaml.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guard-config
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: guard
+    app.kubernetes.io/component: config
+data:
+  # Validated by guard/config.py at load time: an unknown key or an out-of-range value
+  # raises at startup rather than silently disabling monitoring. That is deliberate — a
+  # typo in a configMap must not produce a server that boots happily and monitors nothing.
+  #
+  # The thresholds below are the illustrative values from examples/guard.yaml. They were
+  # chosen so the example runs, NOT so they fit your model. Calibrate them against your own
+  # clean traffic before this reaches a rota — docs/RUNBOOK.md §1 has the procedure and a
+  # runnable script.
+  guard.yaml: |
+    enabled: true
+    window_size: 32
+    drain_every_k: 32
+
+    detectors:
+      - name: entropy
+        enabled: true
+        params:
+          quantile: 0.99
+      - name: divergence
+        enabled: true
+      - name: embedding
+        enabled: true
+        params:
+          cov_every: 32
+
+    # Keyed by METRIC name, not detector name. A metric with no entry here is exported to
+    # Prometheus but can never page anyone. A MISSPELLED metric name is silently ignored
+    # (`thresholds` is an open mapping) — assert
+    # `set(config.thresholds) <= set(monitor.metric_names)` in your startup path.
+    thresholds:
+      js_divergence:
+        method: page_hinkley
+        threshold: 0.05
+        delta: 0.002
+        debounce: 3
+        cooldown: 20
+      entropy_mean:
+        method: page_hinkley
+        threshold: 2.0
+        delta: 0.05
+        debounce: 3
+        cooldown: 20
+      embedding_mahalanobis_mean:
+        method: cusum
+        threshold: 8.0
+        delta: 0.5
+        debounce: 2
+        cooldown: 20
+
+    export:
+      enabled: true
+      prometheus_port: 9300
+      namespace: guard
+      push_gateway_url: null
+---
+# Baselines are versioned, checksummed artifacts BOUND TO A MODEL VERSION.
+#
+# Why they get their own volume instead of being baked into the image or stuffed into a
+# configMap:
+#
+#   1. A baseline is the trust anchor for every drift verdict. `guard.baseline.store.save`
+#      embeds a SHA-256 over the tensor content and the model version; `load` recomputes it
+#      and raises BaselineIntegrityError if a single byte moved. It is a binary tensor
+#      bundle — far past the 1 MiB configMap limit, and base64 in etcd would defeat the
+#      checksum's purpose of being auditable.
+#   2. Model version and baseline version move TOGETHER. A model rollout that ships without
+#      its matching baseline produces drift alerts on a perfectly healthy model — that is
+#      the single most common false page (docs/RUNBOOK.md §3, question 1). Binding the
+#      artifact path to the model version, as the subPath below does, makes the mismatch a
+#      failed mount at startup instead of a 3am page a week later.
+#   3. Re-baselining is recompute -> diff -> human approval -> rollout (design doc §9). An
+#      image that carries its own baseline cannot be re-baselined without a rebuild, which
+#      turns a reviewable data change into a code deploy.
+#
+# ReadOnlyMany so every replica mounts the same immutable bundle. If your storage class has
+# no RWX mode, use an initContainer that pulls the artifact from object storage into an
+# emptyDir and verifies the checksum before the serving container starts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: guard-baselines
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: guard
+    app.kubernetes.io/component: baseline
+spec:
+  accessModes: ["ReadOnlyMany"]
+  # storageClassName: your-rwx-class
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: model-server
+    app.kubernetes.io/component: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0        # GPUs are not fungible spare capacity; surging needs a free GPU
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-server
+        app.kubernetes.io/component: inference
+        # Keep this in lockstep with GUARD_BASELINE_PATH below and with the baseline the
+        # artifact bundle actually contains. It is what makes "which baseline was this
+        # judged against" answerable from `kubectl get pods --show-labels`.
+        model-version: v1.4.2
+      annotations:
+        # Annotation-based scraping, for a plain Prometheus with a kubernetes_sd_config
+        # pod role. If you run the Prometheus Operator, these are inert and
+        # deploy/k8s/servicemonitor.yaml is what actually schedules the scrape — keeping
+        # both costs nothing and means the manifest works either way.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9300"
+        prometheus.io/path: "/metrics"
+        # Force a rollout when guard.yaml changes: a mounted configMap updates in place,
+        # but GUARD reads its config once at startup, so the running process keeps the old
+        # one. Set this to the configMap's hash in CI.
+        # checksum/guard-config: "REPLACE_WITH_CONFIGMAP_HASH"
+    spec:
+      # GPU nodes are usually tainted by the device-plugin installer. Both of these are
+      # cluster-specific; delete them if your GPU nodes are untainted and unlabelled.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        # Matches the UID/GID baked into deploy/docker/Dockerfile. It is a fixed numeric ID
+        # precisely so it can be repeated here and on the baseline volume's permissions.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: model-server
+          # Your serving image, built FROM the reference image in deploy/docker/Dockerfile
+          # (or with `pip install guard-monitor` layered onto your existing serving image).
+          # Pin to a digest in production.
+          image: ghcr.io/example-org/model-server:v1.4.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080     # your serving port
+              protocol: TCP
+            - name: metrics
+              containerPort: 9300     # ExportConfig.prometheus_port default (guard/config.py)
+              protocol: TCP
+          env:
+            # ── GUARD kill-switch ────────────────────────────────────────────────────
+            # GUARD_DISABLE_ENV in guard/safety/firewall.py. Truthy values are
+            # "1"/"true"/"yes"/"on", case-insensitive and whitespace-stripped; anything
+            # else (including "0" and "") leaves monitoring ON.
+            #
+            # KillSwitch reads the variable on every check rather than caching it, but a
+            # pod's environment is immutable once it is running — so flipping this is
+            # `kubectl set env deployment/model-server GUARD_DISABLED=1`, which triggers a
+            # rollout. That is the intended blast radius: it neutralises monitoring across
+            # the fleet without touching serving code or shipping a new image.
+            #
+            # It is wired here, set to "0", on purpose. An env var that is absent has to be
+            # added under incident pressure by someone who has to first find out what it is
+            # called; an env var that is present and set to "0" is one `kubectl set env`
+            # away, and it is visible in `kubectl describe pod` next to everything else.
+            - name: GUARD_DISABLED
+              value: "0"
+
+            # ── Application-side wiring (read by YOUR entrypoint, not by GUARD) ───────
+            # GUARD has no env-var configuration of its own beyond GUARD_DISABLED; these
+            # are the paths your startup code passes to Config.from_yaml and
+            # guard.baseline.store.load.
+            - name: GUARD_CONFIG_PATH
+              value: /etc/guard/guard.yaml
+            - name: GUARD_BASELINE_PATH
+              value: /etc/guard/baselines/v1.4.2/baseline.guard
+            # Pass this to `load(path, expected_model_version=...)` so the artifact's own
+            # bound model version is checked, not just its file path. The path can be
+            # wrong; the checksum-covered metadata inside the file cannot.
+            - name: GUARD_MODEL_VERSION
+              value: v1.4.2
+
+            # PYTORCH_CUDA_ALLOC_CONF is deliberately unset. `expandable_segments:True` may
+            # well be right for your workload, but it changes how the caching allocator
+            # reuses blocks, and GUARD's cross-stream memory safety rests on exactly that
+            # machinery (prime directive #3, `record_stream`). If you enable it, set it HERE
+            # so it shows up in `kubectl describe` next to the incident, and re-run
+            # `pytest -m gpu` against that setting first.
+            # - name: PYTORCH_CUDA_ALLOC_CONF
+            #   value: "expandable_segments:True"
+
+            - name: HOME
+              value: /tmp
+            - name: TORCH_HOME
+              value: /tmp/torch
+          resources:
+            # Extended resources cannot be overcommitted: nvidia.com/gpu must appear
+            # identically in requests and limits, and it is what pins this pod to one GPU.
+            #
+            # GUARD's own footprint is bounded and allocated once at startup (prime
+            # directive #5): the ring buffer is
+            # `ring_slots x max_batch x (num_classes + embed_dim) x 4` bytes of device
+            # memory, plus `max_pending_drains` pinned host buffers of
+            # `drain_every_k x n_metrics x 4` bytes each. Read the real numbers off your
+            # deployment with `monitor.stats().ring_bytes` / `.pinned_bytes` — for typical
+            # settings this is single-digit MiB, but it is your job to check, not to
+            # assume, since it scales with max_batch.
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Probes ───────────────────────────────────────────────────────────────────
+          #
+          # EVERY PROBE BELOW TARGETS THE SERVING PORT (8080). NONE OF THEM TOUCHES 9300,
+          # /metrics, or any GUARD state.
+          #
+          # This is prime directive #1 — "monitoring must never block, stall, or crash
+          # inference" — applied to the orchestrator. In-process, the exception firewall
+          # guarantees that a failing detector cannot reach the serving path. That
+          # guarantee is worth nothing if the platform then kills the pod because the
+          # monitor's metrics endpoint went quiet.
+          #
+          # Concretely, a probe on /metrics would mean:
+          #   * a tripped detector breaker, or a drain thread that died, restarts a pod
+          #     that is serving perfectly well;
+          #   * `GUARD_DISABLED=1` — the documented way to turn monitoring off during an
+          #     incident — becomes a CrashLoopBackOff of the entire fleet;
+          #   * the readiness gate for taking traffic depends on an observability
+          #     component, which inverts the dependency the whole design is built on.
+          #
+          # Monitoring is best-effort observability, never a hard dependency of serving.
+          # When GUARD is unhealthy you want an ALERT (see deploy/prometheus/guard-alerts.yml
+          # for the rules on guard_detectors_disabled, guard_summaries_dropped_total and
+          # friends) — not a restart. Alerts wake a human who can read a traceback; restarts
+          # destroy the state that traceback came from.
+          startupProbe:
+            # Model load + CUDA context init is slow and highly variable. A generous
+            # startup probe is what keeps the liveness probe's short period from killing a
+            # pod that is merely still loading weights.
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60      # up to 10 minutes to load
+          readinessProbe:
+            # "Can this replica serve a request right now." Gate it on the model being
+            # loaded and the GPU being usable — nothing else.
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            # "Is this process wedged." Keep it cheap and keep it independent of anything
+            # that can be legitimately degraded.
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4       # ~1 minute of consecutive failures before a restart
+          volumeMounts:
+            - name: guard-config
+              mountPath: /etc/guard/guard.yaml
+              subPath: guard.yaml
+              readOnly: true
+            - name: guard-baselines
+              # subPath binds the mount to the model version. If the PVC does not contain
+              # a directory for the version this pod claims to be, the mount fails and the
+              # pod never starts — which is exactly the failure you want, rather than a
+              # server that boots and quietly compares v1.4.2 against v1.3.0's baseline.
+              mountPath: /etc/guard/baselines/v1.4.2
+              subPath: v1.4.2
+              readOnly: true
+            # readOnlyRootFilesystem needs writable scratch: torch writes to $TORCH_HOME
+            # and CUDA/JIT caches land under $HOME.
+            - name: tmp
+              mountPath: /tmp
+            # PyTorch's shared-memory allocator needs more than the 64 MiB default that
+            # containers get.
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: guard-config
+          configMap:
+            name: guard-config
+        - name: guard-baselines
+          persistentVolumeClaim:
+            claimName: guard-baselines
+            readOnly: true
+        - name: tmp
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi

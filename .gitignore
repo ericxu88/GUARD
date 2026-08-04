@@ -8,11 +8,26 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
 .coverage
 htmlcov/
+.DS_Store
+
+# Model weights and generated baseline artifacts. A baseline is a *versioned artifact*
+# bound to a model version; it belongs in a model registry or object store, not in git
+# (see docs/RUNBOOK.md).
 *.pt
 *.pth
-baselines/*.guard
-.DS_Store
-/docs/
-CLAUDE.md
+baselines/
+examples/baselines/
+
+# Benchmark and profiler output.
+*.nsys-rep
+*.sqlite
+*.qdrep
+benchmark-results/
+
+# NOTE: docs/ and CLAUDE.md were previously ignored. They are tracked now — the README
+# links to docs/GUARD_design.md, and every detector docstring cites CLAUDE.md as the
+# normative source of the prime directives. Ignoring them meant a clone contained
+# dangling references to documents it did not have.

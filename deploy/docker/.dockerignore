@@ -1,0 +1,55 @@
+# Build context exclusions for deploy/docker/Dockerfile.
+#
+# HOW DOCKER FINDS THIS FILE. The build context is the repository root, and Docker looks
+# for ignore rules at the context root (`.dockerignore`) — not next to the Dockerfile.
+# BuildKit additionally honours `<dockerfile-path>.dockerignore`. So either:
+#
+#   ln -s deploy/docker/.dockerignore .dockerignore                  # context root
+#   cp deploy/docker/.dockerignore deploy/docker/Dockerfile.dockerignore   # BuildKit
+#
+# Without one of those this file is inert and the whole repo — including .git, the venv,
+# and every baseline artifact — is uploaded to the daemon and can be COPYied into a layer.
+
+# Version control and CI
+.git
+.github
+.gitignore
+
+# Local environments and caches. `.venv` in particular holds a CPU-or-host-CUDA torch that
+# must never end up inside a GPU image.
+.venv
+venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.hypothesis
+*.egg-info
+build
+dist
+
+# Baselines are versioned, checksummed artifacts bound to a model version. They are
+# mounted at runtime (PVC / object storage), never baked into the image: an image that
+# carries its own baseline cannot be re-baselined without a rebuild, and the whole
+# re-baseline workflow (recompute -> diff -> human approval -> rollout, design doc §9)
+# depends on the artifact being independently versioned.
+baselines
+*.guard
+
+# Tests and benchmarks: run in CI, not shipped. The GPU benchmarks in particular pull
+# profiling tooling that has no place in a serving image.
+tests
+benchmarks
+conftest.py
+
+# Docs and deploy manifests. The manifests describe the image; they do not belong in it.
+docs
+deploy
+*.md
+!README.md
+
+# Editor and OS noise
+.vscode
+.idea
+.DS_Store

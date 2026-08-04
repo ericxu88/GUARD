@@ -29,7 +29,11 @@ def _np_softmax(logits: np.ndarray) -> np.ndarray:
 
 def _np_entropy(logits: np.ndarray, eps: float = EPS) -> np.ndarray:
     p = _np_softmax(logits)
-    return -(p * np.log(p + eps)).sum(axis=1)
+    # The floor goes INSIDE the log (max(p, eps)), not added to p. `np.log(p + eps)` is the
+    # old buggy formula: log(1 + eps) > 0 makes H come out at about -1e-12 for a saturated
+    # row, so a reference written that way would happily "confirm" a negative entropy.
+    # Numerically the two agree to ~1e-12, so every existing parity assertion still holds.
+    return np.maximum(-(p * np.log(np.maximum(p, eps))).sum(axis=1), 0.0)
 
 
 # --------------------------------------------------------------------------------------
@@ -194,3 +198,149 @@ def test_satisfies_detector_protocol() -> None:
     from guard.detectors.base import Detector
 
     assert isinstance(EntropyDetector(), Detector)
+
+
+# --------------------------------------------------------------------------------------
+# Regression (A): saturated softmax must never yield a negative entropy
+#
+# The old implementation was `-(p * (p + eps).log())`. For a confident prediction p≈1 that
+# is `-(1 * log(1 + 1e-12)) = -1e-12` — negative. It looks like noise but is not: a negative
+# H falls below the first entropy-histogram bin edge (0.0) and `torch.histogram` *silently
+# discards* out-of-range samples, so every confident sample disappeared from the baseline.
+# On a well-trained model that empties the histogram entirely and pins `entropy_pop_shift`
+# at a constant 0.5 against the exact data it was calibrated on.
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize("c", [2, 10, 1000])
+def test_saturated_logits_entropy_is_nonnegative(c: int) -> None:
+    # One logit at +60, the rest at -30: a 90-nat gap saturates softmax to p_max == 1.0 in
+    # float64 while the remaining probabilities (~1e-39) stay below eps, which is exactly
+    # the regime where the `p + eps` form goes negative.
+    logits = torch.full((8, c), -30.0, dtype=torch.float64)
+    logits[:, 0] = 60.0
+
+    h = softmax_entropy(logits, EPS)
+
+    assert torch.all(h >= 0.0), f"negative entropy for C={c}: {h.min()}"
+    assert torch.all(h <= math.log(c) + 1e-9), f"entropy above log C for C={c}: {h.max()}"
+
+
+def test_saturated_entropy_survives_histogram_binning() -> None:
+    """The consequence the sign bug actually caused: samples dropped from the baseline."""
+    c = 10
+    logits = torch.full((256, c), -30.0, dtype=torch.float64)
+    logits[:, 0] = 60.0
+
+    base = _baseline_from_logits(logits, c)
+
+    # With H = -1e-12 every one of the 256 samples lands outside [0, log C] and is dropped.
+    assert float(base.entropy_histogram.sum()) == 256.0
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    arr=arrays(
+        dtype=np.float64,
+        # Magnitudes up to 1e3 push softmax fully into the saturated/underflow regime where
+        # some probabilities are exactly 0 and others are exactly 1.
+        shape=st.tuples(st.integers(1, 8), st.integers(2, 64)),
+        elements=st.floats(-1e3, 1e3, allow_nan=False, allow_infinity=False, width=64),
+    )
+)
+def test_entropy_in_zero_to_log_c_for_extreme_logits(arr: np.ndarray) -> None:
+    logits = torch.from_numpy(arr)
+    c = logits.shape[1]
+
+    h = softmax_entropy(logits, EPS)
+
+    assert torch.all(torch.isfinite(h))
+    # Exact 0 lower bound (not -atol): H is a Shannon entropy, it cannot be negative, and
+    # downstream histogram binning treats anything below 0 as out of range.
+    assert torch.all(h >= 0.0)
+    assert torch.all(h <= math.log(c) + 1e-9)
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_one_hot_row_entropy_is_exactly_zero(dtype: torch.dtype) -> None:
+    # exp(-800) underflows to exactly 0.0 in both float32 and float64, so p is a true
+    # one-hot vector and the 0·log 0 terms must contribute exactly 0 (not NaN, not -0-ish).
+    logits = torch.zeros(4, 16, dtype=dtype)
+    logits[:, 0] = 800.0
+
+    h = softmax_entropy(logits, EPS)
+
+    assert torch.equal(h, torch.zeros_like(h)), f"{dtype}: expected exact 0, got {h}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+@pytest.mark.parametrize("c", [2, 10, 1000])
+def test_uniform_row_entropy_is_log_c(dtype: torch.dtype, c: int) -> None:
+    # The opposite extreme of the one-hot case: H must reach the upper bound, not fall
+    # short of it because of the eps floor.
+    h = softmax_entropy(torch.zeros(4, c, dtype=dtype), EPS)
+
+    expected = torch.full_like(h, math.log(c))
+    assert torch.allclose(h, expected, rtol=1e-6, atol=1e-6), f"{dtype}, C={c}: {h}"
+
+
+# --------------------------------------------------------------------------------------
+# Regression (B): half precision must not produce NaN or raise
+#
+# eps = 1e-12 underflows to exactly 0 in float16, so the log floor stopped working and a
+# saturated row produced log(0) = -inf -> NaN. Separately, `torch.quantile` raises
+# RuntimeError ("quantile() input tensor must be either float or double dtype") on half
+# inputs. Autocast serving emits exactly these dtypes, so both failures are the default
+# production path, and a NaN score never crosses an alert threshold.
+# --------------------------------------------------------------------------------------
+_HALF_DTYPES = [torch.float16, torch.bfloat16]
+
+
+def _realistic_logits() -> torch.Tensor:
+    """B=32, C=1000 ImageNet-shaped logits, scaled so some softmax entries are exactly 0."""
+    torch.manual_seed(20)
+    return torch.randn(32, 1000, dtype=torch.float32) * 20.0
+
+
+def test_realistic_half_logits_contain_exact_softmax_zeros() -> None:
+    """Guard the premise of the tests below: this input really does hit the log(0) path."""
+    p = torch.softmax(_realistic_logits().half().float(), dim=1)
+    assert int((p == 0).sum()) > 0
+
+
+@pytest.mark.parametrize("dtype", _HALF_DTYPES)
+def test_detector_half_precision_scores_are_finite(dtype: torch.dtype) -> None:
+    det = EntropyDetector(quantile=0.99)
+
+    # Must not raise (torch.quantile on half) and must not be NaN (log(0) via eps underflow).
+    scores = det.compute(_realistic_logits().to(dtype), embeddings=torch.empty(0)).scores
+
+    assert set(scores) == {"entropy_mean", "entropy_quantile"}
+    for name, value in scores.items():
+        assert torch.isfinite(value), f"{dtype} {name} is not finite: {value}"
+        assert float(value) >= 0.0, f"{dtype} {name} is negative: {value}"
+        assert float(value) <= math.log(1000) + 1e-5, f"{dtype} {name} above log C: {value}"
+
+
+@pytest.mark.parametrize("dtype", _HALF_DTYPES)
+def test_half_precision_matches_float32(dtype: torch.dtype) -> None:
+    det = EntropyDetector(quantile=0.99)
+    logits32 = _realistic_logits()
+
+    ref = det.compute(logits32, embeddings=torch.empty(0)).scores
+    got = det.compute(logits32.to(dtype), embeddings=torch.empty(0)).scores
+
+    for name in ref:
+        a, b = float(ref[name]), float(got[name])
+        # Loose bound on purpose: the input itself is quantized before we ever see it —
+        # bfloat16 keeps only ~8 mantissa bits, so rounding 1000 logits perturbs the softmax
+        # and hence the true entropy by ~1e-2 relative. The point of the assertion is that
+        # the half path computes the *same quantity*, not that it is bit-accurate.
+        assert abs(a - b) / max(abs(a), 1e-12) < 5e-2, f"{dtype} {name}: fp32={a} half={b}"
+
+
+@pytest.mark.parametrize("dtype", _HALF_DTYPES)
+def test_half_precision_entropy_promotes_to_float32(dtype: torch.dtype) -> None:
+    # The promotion is the fix; asserting it keeps a future "optimization" back to native
+    # half from silently reintroducing both failures.
+    h = softmax_entropy(_realistic_logits().to(dtype), EPS)
+    assert h.dtype == torch.float32
+    assert torch.all(torch.isfinite(h))

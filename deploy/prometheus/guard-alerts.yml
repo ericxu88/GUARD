@@ -1,0 +1,389 @@
+# GUARD Prometheus alerting rules.
+#
+# REFERENCE RULES — not deployed or fired in CI. Every metric name below is read out of
+# guard/export/prometheus.py; the `guard` prefix is ExportConfig.namespace's default, so if
+# you changed `export.namespace` in guard.yaml, change it here too.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# READ THIS BEFORE ROUTING ANY OF THESE TO A PAGER
+#
+# A firing `guard_drift_alert` means INVESTIGATE. It does not mean the model has degraded.
+#
+# GUARD is unsupervised: it has no labels and no ground truth, so it cannot and does not
+# measure accuracy. What it measures is behavioural change relative to a baseline — the
+# output distribution or the embedding distribution has moved away from what the model saw
+# during calibration. That is a LEADING INDICATOR, not a verdict.
+#
+# Drift without degradation is common and legitimate: a seasonal traffic mix, a new
+# customer cohort, an upstream preprocessing change, a marketing campaign. Degradation
+# without drift is also possible. The value of these alerts is that they arrive hours or
+# days before an accuracy metric could, and that they arrive at all in a system where you
+# have no labels. The cost of treating one as a verdict is that someone rolls back a
+# healthy model.
+#
+# So: `severity: warning`, ticket-and-triage, on the drift rules. Reserve paging for the
+# rules in the `guard-self-health` group, where the failure is objective (GUARD is broken)
+# rather than interpretive (something changed).
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# ON THRESHOLDS AND `for:` DURATIONS
+#
+# The comparison values here are STARTING POINTS chosen to be defensible, not measured
+# constants. The two that genuinely have no universal value are `guard_monitor_overhead_us`
+# and `guard_ring_utilization` — both are workload- and hardware-dependent. Record yours
+# from a healthy deployment on day one and set these against that. docs/RUNBOOK.md §4.5.
+#
+# Every `for:` is at least 3x the ServiceMonitor's 30s scrape interval so that a single
+# scrape gap cannot fire a rule, and drift rules are longer still because the change-point
+# tests already debounce internally (`debounce` windows in guard.yaml) — the `for:` clause
+# is a second, independent filter, not the primary one.
+#
+# The drift rules rely on `guard_drift_alert` LATCHING: guard/engine/aggregator.py holds the
+# gauge at 1 for DEFAULT_ALERT_HOLD windows after a firing, because Page-Hinkley and CUSUM
+# fire edges (one `True` on the step the change is detected) and an edge is invisible to a
+# `for:` clause. If you shorten `alert_hold`, or raise `window_size` so far that a hold
+# spans less wall-clock time than the `for:` below, these rules stop firing. Check that
+# relationship after any change to either.
+
+groups:
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  # (a) Drift is firing. Something about the traffic or the model changed. Investigate.
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  - name: guard-drift
+    interval: 30s
+    rules:
+      - alert: GuardDriftDetected
+        # No aggregation: keeping every label means `detector`, `pod`, `model_version` and
+        # `instance` all reach the notification, and each one is a triage step.
+        expr: guard_drift_alert == 1
+        for: 10m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD detector {{ $labels.detector }} is in alarm on {{ $labels.instance }}
+            (model {{ $labels.model_version }})
+          description: >-
+            The change-point test for one of this detector's metrics crossed its threshold
+            and the alert gauge has stayed latched. The label is the DETECTOR, not the
+            metric: `entropy_mean` and `entropy_pop_shift` both raise
+            detector="entropy". Only the Alert payload in the alert sink names the metric.
+          action: >-
+            This is a question, not a verdict — drift is a leading indicator and GUARD
+            measures no accuracy. Work these four in order.
+            (1) Is the baseline the right one? Compare `model_version` on this series and
+            the `baseline_version` in the alert payload against what is actually deployed.
+            A model rollout that shipped without its matching baseline is the single most
+            common false page.
+            (2) What else changed at the same time? Correlate the firing timestamp with the
+            deploy log, preprocessing changes, new clients, routing changes.
+            (3) Which other metrics moved? Read the Grafana panels
+            (deploy/grafana/guard-dashboard.json); the combination table in
+            docs/RUNBOOK.md §3.9 distinguishes covariate shift from label shift from
+            confidence collapse.
+            (4) Is GUARD itself healthy? Check the guard-self-health alerts below — a
+            partially broken monitor produces metric streams with holes, and a holed stream
+            can page. Do not roll back the model on this signal alone.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#3-responding-to-an-alert
+
+      - alert: GuardDriftDetectedMultipleDetectors
+        # Two or more independent views of the data moving together. Still not a verdict,
+        # but a much stronger prior that something real changed upstream.
+        expr: sum by (job, instance) (guard_drift_alert) >= 2
+        for: 10m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            {{ $value }} GUARD detectors are simultaneously in alarm on {{ $labels.instance }}
+          description: >-
+            Entropy, divergence, and embedding drift look at different things — output
+            confidence, predicted-class mix, and penultimate feature geometry. Several
+            firing at once is much harder to explain as detector-specific noise than any
+            one of them alone.
+          action: >-
+            Treat as the highest-priority drift investigation, and start upstream of the
+            model rather than at it: a preprocessing or data-pipeline change moves all
+            three at once, whereas a genuine population shift usually moves the embedding
+            detector first. docs/RUNBOOK.md §3.9 has the combination table. Still
+            investigate before rolling anything back.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#39-reading-the-combination
+
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  # (b) GUARD itself is degraded. These are objective failures — page on them.
+  #
+  # GUARD is built to fail quietly and never harm serving (prime directive #1). The cost of
+  # that design is that its own failures are INVISIBLE unless something watches for them.
+  # This group is that something. Note that the pod's liveness/readiness probes deliberately
+  # do not check any of this — see the probe comments in deploy/k8s/deployment.yaml.
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  - name: guard-self-health
+    interval: 30s
+    rules:
+      - alert: GuardDetectorDisabled
+        # Set from `len(firewall.disabled)` on each drain. A detector reaches this state
+        # after `max_detector_failures` (default 3) exceptions; the firewall then stops
+        # calling it entirely and its metrics simply stop updating.
+        expr: guard_detectors_disabled > 0
+        for: 15m
+        labels:
+          severity: critical
+          component: guard
+        annotations:
+          summary: >-
+            {{ $value }} GUARD detector(s) disabled by the circuit breaker on
+            {{ $labels.instance }}
+          description: >-
+            The safety firewall caught repeated exceptions from a detector and switched it
+            off. Inference is completely unaffected — that is the whole point of the
+            firewall — but you are flying with one instrument dead, and the drift panels
+            for that detector will look deceptively calm because they have simply stopped
+            updating rather than gone quiet.
+          action: >-
+            Identify which detector from `guard_detector_failures_total{detector}` on the
+            same instance, then find the traceback: the firewall logs the FIRST failure at
+            ERROR with `exc_info` and the trip at WARNING, both on the `guard.engine`
+            logger — subsequent identical failures are counted but not logged, so do not
+            wait for a fresh one. In-process, `monitor.firewall.last_error("<detector>")`
+            holds the exception object. Fix the cause, then re-arm with
+            `monitor.firewall.reset("<detector>")` or restart the pod. Re-arming without
+            fixing the cause just burns the failure budget again. Do NOT restart the pod
+            reflexively — the process holds the diagnostic state.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#41-a-detector-was-disabled-by-the-circuit-breaker
+
+      - alert: GuardDetectorFailing
+        # Published as a delta on each drain, so this catches an intermittently failing
+        # detector BEFORE its breaker trips — the difference between a warning and a
+        # blind spot. A detector that fails intermittently is as untrustworthy as one that
+        # fails always: its metric stream has holes, and a drift verdict from a holed
+        # stream is worse than no verdict.
+        expr: rate(guard_detector_failures_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD detector {{ $labels.detector }} is raising exceptions on
+            {{ $labels.instance }}
+          description: >-
+            The firewall is catching exceptions from this detector but its breaker has not
+            tripped yet (default budget: 3 total failures, not consecutive). Every failure
+            leaves a NaN in that step's summary row, which the aggregator skips — so the
+            change-point test for this detector's metrics is running on a stream with gaps.
+          action: >-
+            Get the traceback from the `guard.engine` logger on this pod (ERROR, first
+            failure only). Common causes: a shape or dtype the detector was not built for
+            reaching it from a new model version, a baseline whose `num_classes` or
+            `embed_dim` no longer matches the model, or a numerically degenerate covariance
+            in the embedding detector. Fix it before the breaker trips and turns this into
+            GuardDetectorDisabled.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#41-a-detector-was-disabled-by-the-circuit-breaker
+
+      - alert: GuardSummariesDropped
+        # Every drain_every_k steps the engine enqueues one async D2H copy into a pinned
+        # buffer from a pool of max_pending_drains (default 4). If all are still in flight
+        # the whole block is dropped and counted in units of drain_every_k. It is never
+        # buffered without bound and it never blocks.
+        expr: rate(guard_summaries_dropped_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD is dropping metric summaries on {{ $labels.instance }}
+            ({{ $value | printf "%.2f" }}/s)
+          description: >-
+            The host-side drain thread is not keeping up with inference, so scalar summaries
+            are being sampled rather than collected completely. The change-point tests see
+            fewer windows, which makes drift detection slower and less reliable. Inference
+            is unaffected.
+          action: >-
+            Tune in this order, one at a time. (1) Raise `drain_every_k` in guard.yaml —
+            fewer, larger copies per unit time; the direct fix. Costs metric staleness: a
+            value can be up to `drain_every_k` steps old before export. (2) Raise
+            `max_pending_drains` (a build_monitor kwarg, default 4) to absorb bursts; costs
+            one pinned host buffer per slot. (3) Lower `drain_poll_interval` (default
+            0.05s) if the drain thread is sleeping through completed copies; costs
+            background CPU. Confirm the diagnosis first with
+            `stats().drains_enqueued - stats().drains_completed` sitting at
+            `max_pending_drains`. If you drive the drain yourself
+            (`start_drain_thread=False`), the fix is calling `drain_pending()` more often,
+            not any of the above.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#42-summaries-dropped-under-backpressure-guard_summaries_dropped_total
+
+      - alert: GuardObservationsDropped
+        # observe() rejects a batch — silently by design, counted rather than raised — on
+        # bad rank/width, a batch outside [1, max_batch], a device mismatch, or an active
+        # CUDA graph capture.
+        expr: rate(guard_observations_dropped_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD is rejecting inference batches on {{ $labels.instance }}
+            ({{ $value | printf "%.2f" }}/s)
+          description: >-
+            observe() is dropping whole batches rather than monitoring them. Oversized
+            batches are dropped ENTIRELY, never truncated, so this is a straight loss of
+            coverage: those predictions were served and never seen by any detector.
+          action: >-
+            Find the one WARNING from the `guard.engine` logger at pod startup — only the
+            FIRST rejection is logged, with the reason, and the rest are counted only. That
+            single line is the whole diagnosis. The most common real cause is dynamic
+            batching: a server configured to batch "up to 64" occasionally emits 65, and
+            every one of those is dropped. Set `max_batch` to the server's true maximum,
+            not its nominal one; the cost is ring-buffer memory
+            (`ring_slots x max_batch x (num_classes + embed_dim) x 4` bytes, readable as
+            `stats().ring_bytes`). Other causes: a logits width that no longer matches the
+            baseline's `num_classes`, a device mismatch, or CUDA Graph capture (expected
+            and by design — GUARD cannot record events inside a capture without corrupting
+            the graph).
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#43-observations-dropped-guard_observations_dropped_total
+
+      - alert: GuardNotObservingTraffic
+        # The one failure mode with no dedicated gauge. If the ENGINE's own firewall entry
+        # trips, all monitoring stops, `guard_detectors_disabled` FREEZES at its last
+        # published value (publishing happens on drain, and there are no more drains), and
+        # `monitor.enabled` still reports True because the kill-switch was never flipped.
+        # A flatlined steps counter against a server that is demonstrably serving is the
+        # only reliable external signal — so this rule is not redundant with the others,
+        # it covers the gap they cannot.
+        #
+        # This will also fire whenever GUARD is legitimately off (GUARD_DISABLED=1, or
+        # `enabled: false`). That is correct behaviour: "monitoring is off" should be
+        # visible, not silent. Silence it deliberately in Alertmanager for the duration of
+        # an intentional disable.
+        expr: rate(guard_steps_observed_total[5m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+          component: guard
+        annotations:
+          summary: >-
+            GUARD has observed no batches for 15m on {{ $labels.instance }}
+          description: >-
+            The steps counter is flat. Either this replica is serving no traffic at all, or
+            GUARD has stopped seeing it — the engine's own circuit breaker tripped, the
+            kill-switch is engaged, or observe() is no longer being called.
+          action: >-
+            First confirm the pod is actually serving, using YOUR request-rate metric — if
+            it is idle, this alert is correct and uninteresting. If it is serving: check
+            whether GUARD_DISABLED is truthy on the pod (`kubectl set env
+            deployment/model-server --list`) and whether `enabled: false` reached the
+            configMap; then look for the `guard.engine` ERROR naming component "engine",
+            which means the enqueue path itself tripped and ALL monitoring stopped. If a
+            deploy introduced this, check that observe()/GuardModule is still wired into
+            the forward path at all.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#4-when-guard-itself-is-unhealthy
+
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  # (c) Overhead regression. GUARD's whole claim is that it is nearly free; these rules are
+  #     what keeps that claim honest in production.
+  #
+  #     NOTE ON THE SLO. The design's target is p99 inference overhead < 2%. That is an
+  #     UNVERIFIED SLO — it has not been measured on hardware (docs/GPU_VERIFICATION.md) —
+  #     and, more importantly, it CANNOT be evaluated from these metrics. GUARD exports its
+  #     own enqueue cost; it does not export your inference latency. To alert on the actual
+  #     SLO you need your serving latency histogram compared against a GUARD_DISABLED
+  #     control, which is what benchmarks/ab_latency.py measures offline. The rules below
+  #     are the leading indicators available from GUARD alone.
+  # ═══════════════════════════════════════════════════════════════════════════════════════
+  - name: guard-overhead
+    interval: 30s
+    rules:
+      - alert: GuardMonitorOverheadRegression
+        # Self-relative on purpose: there is no universal "good" value for this gauge, so
+        # comparing a pod against its own yesterday is more honest than any constant I
+        # could put here. The 1d offset means a slow drift upward over weeks will not fire;
+        # pair this with the absolute rule below once you know your own number.
+        expr: >-
+          guard_monitor_overhead_us
+            > 2 * avg_over_time(guard_monitor_overhead_us[1h] offset 1d)
+        for: 30m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD enqueue overhead on {{ $labels.instance }} has doubled versus yesterday
+            (now {{ $value | printf "%.1f" }} us)
+          description: >-
+            `guard_monitor_overhead_us` is the ~100-step EMA of the CPU time observe() adds
+            to the INFERENCE THREAD. It is the honest cost metric because it is what
+            inference actually pays. A sustained rise means something on the enqueue path
+            started doing real work.
+          action: >-
+            The classic cause is a HOST SYNCHRONISATION — a `.item()`, `.cpu()`,
+            `.numpy()`, `.tolist()`, or `torch.cuda.synchronize()` — that reached a
+            detector's compute() or the enqueue path, which serialises the inference stream
+            and converts a free monitor into a double-digit latency tax (prime directive
+            #2). Diff the detectors and the engine against the last known-good deploy and
+            look for one. Other causes: a torch upgrade that changed stream or allocator
+            behaviour (pin the exact build — see pyproject.toml), or a much larger
+            `max_batch`. Reproduce offline with benchmarks/ab_latency.py rather than
+            experimenting in production. If you need immediate relief, `kubectl set env
+            deployment/model-server GUARD_DISABLED=1` removes GUARD from the path entirely
+            without a code change.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#45-overhead-telemetry
+
+      - alert: GuardMonitorOverheadHigh
+        # CALIBRATE THIS. 250us is a placeholder, not a measurement. Record the steady-state
+        # value from a healthy deployment on day one and set this to a few multiples of it.
+        # Leaving the placeholder in place gives you an alert that either never fires or
+        # always does, and both teach your on-call to ignore it.
+        expr: guard_monitor_overhead_us > 250
+        for: 30m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD enqueue overhead on {{ $labels.instance }} is
+            {{ $value | printf "%.1f" }} us
+          description: >-
+            observe() is spending more CPU on the inference thread than the configured
+            budget. Whether that matters depends entirely on your per-request latency: the
+            same absolute number is noise for a 200ms request and a real regression for a
+            2ms one.
+          action: >-
+            Confirm the threshold is calibrated for this deployment before acting — the
+            shipped 250us is a placeholder. If it is calibrated, treat exactly as
+            GuardMonitorOverheadRegression above: look for a host synchronisation on the
+            enqueue path first.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#45-overhead-telemetry
+
+      - alert: GuardRingBufferSaturated
+        # Fraction of used ring slots whose monitor-stream work has not finished, polled
+        # with a non-blocking cudaEventQuery. Persistently near 1.0 is the honest signal
+        # that overlap has stopped being free on this workload.
+        expr: guard_ring_utilization > 0.9
+        for: 15m
+        labels:
+          severity: warning
+          component: guard
+        annotations:
+          summary: >-
+            GUARD ring buffer on {{ $labels.instance }} is
+            {{ $value | humanizePercentage }} in flight
+          description: >-
+            The monitor stream is falling behind inference: nearly every ring slot still has
+            unfinished detector work on it. The low-priority stream is no longer finding
+            enough idle SM capacity between inference kernels. This does not block or slow
+            inference — the monitor stream cannot preempt it — but the monitor is now
+            contending for the GPU rather than filling gaps in it.
+          action: >-
+            Raising `ring_slots` (default 8) buys pipelining depth, not throughput, and is
+            the wrong fix if the detectors genuinely cost more than the gaps inference
+            leaves. Reduce the detector work instead: raise `cov_every` in the embedding
+            detector's params (the covariance drift term is an O(D^3) matmul — at D=768
+            that is comparable to a whole transformer layer), or disable the `embedding`
+            detector entirely if the other two suffice. Measure with
+            benchmarks/ab_latency.py and benchmarks/saturation.py rather than guessing; the
+            saturation benchmark is specifically the workload where this metric goes to 1.
+          runbook_url: https://github.com/ericxu88/GUARD/blob/main/docs/RUNBOOK.md#44-ring-utilisation-guard_ring_utilization

@@ -106,11 +106,14 @@ def build_baseline(
                 f"logits and embeddings must have the same batch size, "
                 f"got {logits.shape[0]} vs {embeddings.shape[0]}"
             )
-        logits_f64 = logits.detach().double()
-        emb_f64 = embeddings.detach().double()
+        # Accumulators live on CPU in float64, so batches are brought across in one move.
+        # Without the explicit device transfer a CUDA dataloader — the normal way to
+        # produce these tensors — dies on a device-mismatch RuntimeError in the first sum.
+        logits_f64 = logits.detach().to(device="cpu", dtype=torch.float64)
+        emb_f64 = embeddings.detach().to(device="cpu", dtype=torch.float64)
 
         softmax_sum += torch.softmax(logits_f64, dim=1).sum(0)
-        entropy_vals.append(softmax_entropy(logits_f64).cpu())
+        entropy_vals.append(softmax_entropy(logits_f64))
         n_embed, embed_mean, embed_m2 = _welford_update(n_embed, embed_mean, embed_m2, emb_f64)
         n_samples += logits.shape[0]
 
@@ -121,11 +124,17 @@ def build_baseline(
     q = (softmax_sum / n_samples).to(dtype)
     q = q / q.sum()
 
-    # Entropy histogram.
+    # Entropy histogram. torch.histogram *discards* samples outside [edges[0], edges[-1]],
+    # so anything that lands even one ulp outside the theoretical [0, log C] support — a
+    # uniform prediction rounding to log C + 1e-7 in float32, say — would silently vanish
+    # from the reference. Clamping into the support keeps the histogram a faithful count of
+    # every sample the builder saw.
     all_h = torch.cat(entropy_vals)
     log_c = torch.tensor(num_classes, dtype=torch.float64).log()
     edges = torch.linspace(0.0, float(log_c), n_bins + 1, dtype=dtype)
-    hist = torch.histogram(all_h.to(dtype), bins=edges).hist
+    hist = torch.histogram(
+        all_h.to(dtype).clamp_(float(edges[0]), float(edges[-1])), bins=edges
+    ).hist
 
     # Embedding mean and regularised precision (Σ + λ·I)⁻¹.
     mu = embed_mean.to(dtype)

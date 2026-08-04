@@ -16,6 +16,8 @@ scalar of cumulative state ⇒ O(1) per step, deterministic given the input sequ
 
 from __future__ import annotations
 
+import math
+
 from guard.config import ThresholdConfig
 from guard.temporal.base import AlertGate, ChangePointResult
 
@@ -67,9 +69,20 @@ class PageHinkley:
         """Clear all accumulated state including the alert gate."""
         self._reset_statistic()
         self._gate.reset()
+        self.skipped = 0
 
     def update(self, x: float) -> ChangePointResult:
-        """Feed one scalar; return the statistic and whether an alarm fires this step."""
+        """Feed one scalar; return the statistic and whether an alarm fires this step.
+
+        Non-finite input is skipped rather than folded in. A single NaN (one inf logit, one
+        degenerate batch) would poison the running mean and pin the statistic at NaN for
+        the life of the process: ``NaN > threshold`` is False, so the test would never
+        alarm again — a silent, permanent monitoring outage.
+        """
+        if not math.isfinite(x):
+            self.skipped += 1
+            return ChangePointResult(alarm=False, statistic=self._cum - self._cum_min)
+
         self._n += 1
         self._x_mean += (x - self._x_mean) / self._n
         self._cum += x - self._x_mean - self.delta

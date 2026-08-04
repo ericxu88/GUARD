@@ -1,0 +1,98 @@
+# Prometheus Operator scrape configuration for GUARD.
+#
+# REFERENCE MANIFEST — not applied in CI.
+#
+# A ServiceMonitor selects a Service, and the Operator then scrapes the Service's ENDPOINTS
+# (the individual pods), not the Service's cluster IP. That distinction matters here: GUARD
+# is per-process state. `guard_ring_utilization`, `guard_monitor_overhead_us`, and each
+# detector's change-point tests are computed inside one replica's own engine, and averaging
+# them across replicas behind a single load-balanced target would blend an unhealthy replica
+# into a healthy fleet until it disappeared. Per-pod endpoints keep `instance` meaningful,
+# which is what makes every rule in deploy/prometheus/guard-alerts.yml actionable.
+#
+# Requires the Prometheus Operator CRDs. Without them, use the prometheus.io/* pod
+# annotations already set in deploy/k8s/deployment.yaml instead.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: model-server
+    app.kubernetes.io/component: inference
+    # The ServiceMonitor's selector matches on this. It exists as a separate, explicit
+    # label so that adding a second Service in front of the same pods (say, an internal
+    # gRPC one) does not silently double every metric series.
+    guard.io/scrape: "true"
+spec:
+  type: ClusterIP
+  # Headless. The Operator builds its target list from the EndpointSlice either way, so
+  # this changes nothing about scraping — but it stops anything else in the cluster from
+  # accidentally load-balancing across replicas when it meant to address one.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: model-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      # 9300 is ExportConfig.prometheus_port's default in guard/config.py, the EXPOSE in
+      # deploy/docker/Dockerfile, and the `metrics` containerPort in deployment.yaml.
+      # Change all four together.
+      port: 9300
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: guard
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: guard
+    app.kubernetes.io/component: monitoring
+    # Your Prometheus CR's `serviceMonitorSelector` must match this, or the Operator will
+    # ignore the object entirely and you will get no error anywhere — just no targets.
+    # Check with: kubectl get prometheus -A -o jsonpath='{..serviceMonitorSelector}'
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames: ["inference"]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-server
+      guard.io/scrape: "true"
+  endpoints:
+    - port: metrics          # the Service port NAME, not the number
+      path: /metrics
+      scheme: http
+      # GUARD exports gauges that are already windowed (window_size steps per value) and
+      # counters published as deltas on each drain. A 30s interval is a reasonable default:
+      # fast enough that a latched guard_drift_alert — held for DEFAULT_ALERT_HOLD windows
+      # by guard/engine/aggregator.py — cannot be missed between scrapes, slow enough not
+      # to matter. If you raise window_size or drain_every_k substantially, check that a
+      # latch still spans at least two scrapes before you trust the `for:` durations in
+      # deploy/prometheus/guard-alerts.yml.
+      interval: 30s
+      scrapeTimeout: 10s
+      # prometheus_client serves the whole registry synchronously in a daemon thread. It
+      # never touches the inference thread or the monitor stream, so a slow scrape cannot
+      # affect serving — but honourLabels stays false so a scrape can never overwrite the
+      # job/instance labels the alert rules group by.
+      honorLabels: false
+      relabelings:
+        # Carry the pod's model-version label onto every series. Worth the cardinality: the
+        # first question for any drift alert is "was this model deployed with its matching
+        # baseline?", and without this label answering it means leaving Prometheus.
+        - sourceLabels: [__meta_kubernetes_pod_label_model_version]
+          targetLabel: model_version
+          action: replace
+      # `pod`, `namespace`, `service`, and `endpoint` are attached by the Operator itself;
+      # do not re-add them here.
+      #
+      # If this endpoint also serves your application's own metrics and you want the two
+      # split, add a metricRelabelings keep on `__name__ =~ "guard_.*"`. Not enabled by
+      # default: dropping metrics is a decision, not a default.

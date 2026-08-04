@@ -4,11 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "guard-monitor"
-version = "0.1.0"
+version = "0.2.0"
 description = "GPU-native unsupervised anomaly & runtime drift monitor for ML inference"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
+keywords = ["mlops", "monitoring", "drift-detection", "cuda", "pytorch", "observability"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Monitoring",
+]
 
 # NOTE: pin `torch` to the EXACT build your serving cluster uses. CUDA stream and caching
 # allocator behavior (record_stream, stream priorities) is version-sensitive — a mismatch
@@ -19,14 +29,23 @@ dependencies = [
     "pydantic>=2.7",       # config + baseline schema validation
     "pyyaml>=6.0",         # config files
     "prometheus-client>=0.20",
-    "opentelemetry-api>=1.25",
-    "opentelemetry-sdk>=1.25",
 ]
+
+[project.urls]
+Documentation = "https://github.com/ericxu88/GUARD/blob/main/docs/GUARD_design.md"
+Source = "https://github.com/ericxu88/GUARD"
 
 [project.optional-dependencies]
 # Reference/demo target (ViT-B/16). Swap if you change the monitored model.
 demo = [
     "torchvision>=0.20",
+]
+# OpenTelemetry export is optional: Prometheus is the default because it is what most GPU
+# serving stacks already scrape, and a monitoring library should not force a second
+# telemetry pipeline on people who do not use one. guard/export/otel.py imports lazily.
+otel = [
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
 ]
 dev = [
     "pytest>=8.2",
@@ -35,10 +54,18 @@ dev = [
     "mypy>=1.10",
     "hypothesis>=6.100",   # property-based tests for detectors
     "types-PyYAML>=6.0",   # stubs so `mypy --strict` typechecks config YAML I/O
+    "opentelemetry-api>=1.25",   # so the OTel sink is covered by the test suite
+    "opentelemetry-sdk>=1.25",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["guard"]
+
+# PEP 561: ship the inline type annotations so downstream mypy/pyright users actually see
+# them. Without py.typed in the wheel, a strictly-typed library is untyped to everyone who
+# installs it.
+[tool.hatch.build.targets.wheel.force-include]
+"guard/py.typed" = "guard/py.typed"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
@@ -59,6 +86,12 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # against look-alike characters in actual code.
 ignore = ["RUF002", "RUF003"]
 
+[tool.ruff.lint.per-file-ignores]
+# Benchmarks and examples are scripts: they put the repo root on sys.path before importing
+# guard, so their imports legitimately follow executable statements.
+"benchmarks/*.py" = ["E402"]
+"examples/*.py" = ["E402"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
@@ -66,5 +99,5 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 # torch's stubs are partial; relax just for the import boundary, not for our code.
 [[tool.mypy.overrides]]
-module = ["torch.*", "torchvision.*", "prometheus_client.*"]
+module = ["torch.*", "torchvision.*", "prometheus_client.*", "opentelemetry.*"]
 ignore_missing_imports = true

@@ -23,7 +23,9 @@ def _tiny_baseline(c: int = 3, d: int = 4) -> Baseline:
         num_classes=c,
         embed_dim=d,
         class_distribution=torch.full((c,), 1.0 / c),
-        entropy_histogram=torch.zeros(8),
+        # Must contain mass: an all-zero histogram normalizes to an all-zero reference,
+        # against which every live batch scores a constant 0.5 TV distance forever.
+        entropy_histogram=torch.full((8,), 12.5),
         entropy_bin_edges=torch.linspace(0.0, 1.0, 9),
         embed_mean=torch.zeros(d),
         embed_precision=torch.eye(d),

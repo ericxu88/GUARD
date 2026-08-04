@@ -19,9 +19,21 @@ from __future__ import annotations
 import torch
 
 from guard.baseline.schema import Baseline
-from guard.detectors.base import DetectorResult
+from guard.detectors.base import DetectorResult, DeviceCache
 
 _DEFAULT_EPS = 1e-12
+
+
+def _promote(x: torch.Tensor) -> torch.Tensor:
+    """Promote half precision to float32; leave float32/float64 alone.
+
+    ``eps = 1e-12`` underflows to exactly 0 in float16, so the smoothing that is supposed
+    to prevent ``log(0)`` silently stops working and a peaked ``P`` (an exact zero in the
+    batch-mean softmax, which happens routinely under autocast) turns both KL and JS into
+    NaN. A NaN never crosses a threshold, so the drift alert would be off with no error
+    anywhere — the worst possible failure mode for a monitor.
+    """
+    return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
 
 
 def _as_distribution(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -30,7 +42,7 @@ def _as_distribution(x: torch.Tensor, eps: float) -> torch.Tensor:
     Additive smoothing keeps this branch-free (no host sync): a degenerate all-zero input
     becomes uniform rather than a near-zero vector that fails to sum to 1.
     """
-    x = x.clamp_min(0.0) + eps
+    x = _promote(x).clamp_min(0.0) + eps
     return x / x.sum()
 
 
@@ -71,18 +83,21 @@ class DivergenceDetector:
     """
 
     name = "divergence"
+    metric_names: tuple[str, ...] = ("kl_divergence", "js_divergence")
 
     def __init__(self, baseline: Baseline, eps: float = _DEFAULT_EPS) -> None:
         self.eps = eps
         self._baseline = baseline
-        self._q = _as_distribution(baseline.class_distribution, eps)
+        self._q = DeviceCache(_as_distribution(baseline.class_distribution, eps))
 
     def compute(self, logits: torch.Tensor, embeddings: torch.Tensor) -> DetectorResult:
         """Reduce one batch of logits to KL and JS divergence against ``Q``."""
         del embeddings  # divergence depends only on the output distribution
-        p = mean_softmax(logits)
-        # Match Q to the live tensor's device/dtype (one small copy, not a host sync).
-        q = self._q.to(device=p.device, dtype=p.dtype)
+        # Promote before matching Q's dtype: casting Q *down* to half would defeat the
+        # promotion inside _as_distribution and put the NaN back.
+        p = mean_softmax(_promote(logits))
+        # Q, already resident on the serving device — no per-batch host->device copy.
+        q = self._q.like(p)
         return DetectorResult(
             scores={
                 "kl_divergence": kl_divergence(p, q, self.eps),

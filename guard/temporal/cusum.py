@@ -22,6 +22,8 @@ For continuous alarming during a sustained shift, supply a fixed ``target``.
 
 from __future__ import annotations
 
+import math
+
 from guard.config import ThresholdConfig
 from guard.temporal.base import AlertGate, ChangePointResult
 
@@ -79,10 +81,21 @@ class Cusum:
         self._n = 0
         self._x_mean = 0.0
         self._s = 0.0
+        self.skipped = 0
         self._gate.reset()
 
     def update(self, x: float) -> ChangePointResult:
-        """Feed one scalar; return the statistic and whether an alarm fires this step."""
+        """Feed one scalar; return the statistic and whether an alarm fires this step.
+
+        Non-finite input is skipped rather than folded in. One NaN would make the running
+        mean NaN, after which ``max(0.0, NaN)`` returns 0.0 on every subsequent step and
+        the statistic can never cross the threshold again — the test would be silently and
+        permanently dead.
+        """
+        if not math.isfinite(x):
+            self.skipped += 1
+            return ChangePointResult(alarm=False, statistic=self._s)
+
         self._n += 1
         self._x_mean += (x - self._x_mean) / self._n
         target = self._x_mean if self.target is None else self.target
