@@ -727,3 +727,116 @@ def test_dropping_a_monitor_without_closing_stops_its_drain_thread() -> None:
 
     assert ref() is None, "monitor was kept alive by its own drain thread"
     assert not thread.is_alive(), "drain thread outlived the monitor it served"
+
+
+# --------------------------------------------------------------------------------------
+# Stress: bounded resources and lock correctness under contention
+# --------------------------------------------------------------------------------------
+def test_state_stays_bounded_over_a_long_run() -> None:
+    # Prime directive #5. A leak here is invisible in a short test and fatal in a serving
+    # process that runs for weeks — and it would leak *device* memory on a GPU, where the
+    # blast radius is an OOM in the model, not in GUARD.
+    import gc
+
+    sink = RecordingSink()
+    monitor = _monitor([CountingDetector()], sink=sink, drain_every_k=8, max_pending_drains=4)
+    for _ in range(200):  # warm up: lazy allocations settle here
+        monitor.observe(*_batch())
+        monitor.drain_pending()
+    monitor.flush()
+    gc.collect()
+    before_objects = len(gc.get_objects())
+    before_pending = len(monitor._pending)
+    ring_bytes = monitor.stats().ring_bytes
+    pinned_bytes = monitor.stats().pinned_bytes
+
+    for _ in range(3000):
+        monitor.observe(*_batch())
+        monitor.drain_pending()
+    monitor.flush()
+    gc.collect()
+
+    assert monitor.stats().ring_bytes == ring_bytes, "ring buffer grew"
+    assert monitor.stats().pinned_bytes == pinned_bytes, "pinned pool grew"
+    assert len(monitor._pending) == before_pending, "the pending-drain queue grew"
+    assert monitor._pool.free == monitor._pool.capacity, "a pinned buffer leaked"
+    # Aggregator windows are deques with maxlen; alert latches are one int per metric.
+    assert all(
+        len(w) <= monitor.aggregator.window_size for w in monitor.aggregator._rolling.values()
+    )
+    growth = len(gc.get_objects()) - before_objects
+    assert growth < 2000, f"python object count grew by {growth} over 3000 steps"
+    monitor.close()
+
+
+def test_no_step_is_lost_under_heavy_thread_contention() -> None:
+    # A lock bug is normally hidden by the GIL: bytecode rarely switches at the wrong
+    # moment. Dropping the switch interval to a microsecond makes the interpreter preempt
+    # aggressively, so a missing lock loses updates instead of getting lucky.
+    import sys
+
+    original = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        monitor = _monitor([CountingDetector()], drain_every_k=16, max_pending_drains=8)
+        threads = [
+            threading.Thread(target=lambda: [monitor.observe(*_batch(2)) for _ in range(60)])
+            for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60.0)
+        assert all(not t.is_alive() for t in threads), "an observer thread deadlocked"
+
+        stats = monitor.stats()
+        assert stats.steps_observed == 8 * 60
+        assert stats.observations_dropped == 0
+        # Every step got a distinct ring slot and a distinct summary row: no two threads
+        # can have been handed the same slot index.
+        assert monitor._slot == (8 * 60) % monitor._ring.slots
+        monitor.close()
+    finally:
+        sys.setswitchinterval(original)
+
+
+def test_drain_and_observe_can_run_concurrently_without_deadlock() -> None:
+    # `_enqueue` holds _lock and takes _pending_lock; the drain thread takes _drain_lock,
+    # then _pending_lock, then _lock inside _publish_telemetry. If those orders ever
+    # conflicted, this is where it would hang.
+    import sys
+
+    original = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    stop = threading.Event()
+    try:
+        monitor = _monitor([CountingDetector()], drain_every_k=4, max_pending_drains=4)
+
+        def drainer() -> None:
+            while not stop.is_set():
+                monitor.drain_pending()
+
+        drains = [threading.Thread(target=drainer) for _ in range(3)]
+        for t in drains:
+            t.start()
+        observers = [
+            threading.Thread(target=lambda: [monitor.observe(*_batch(2)) for _ in range(100)])
+            for _ in range(4)
+        ]
+        for t in observers:
+            t.start()
+        for t in observers:
+            t.join(timeout=60.0)
+        assert all(not t.is_alive() for t in observers), "observe() deadlocked against drain"
+        stop.set()
+        for t in drains:
+            t.join(timeout=10.0)
+        assert all(not t.is_alive() for t in drains), "drain_pending() deadlocked"
+
+        monitor.flush()
+        assert monitor.stats().steps_observed == 400
+        assert monitor._pool.free == monitor._pool.capacity, "a buffer leaked under contention"
+        monitor.close()
+    finally:
+        stop.set()
+        sys.setswitchinterval(original)

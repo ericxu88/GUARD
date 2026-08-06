@@ -512,7 +512,11 @@ def test_cuda_stream_accepts_the_arguments_the_engine_passes() -> None:
     assert "priority" in doc, "torch.cuda.Stream no longer documents a priority argument"
     for method in ("wait_event", "synchronize", "record_event", "query"):
         assert hasattr(torch.cuda.Stream, method), f"torch.cuda.Stream lost {method}()"
-    assert hasattr(torch.cuda.Stream, "priority")
+    # torch's own docs: out-of-range priorities clamp, with "large positive numbers" mapping
+    # to the *lowest* priority. The monitor passes 0, which is the least priority on all
+    # current hardware and torch's default; the engine rejects negatives outright, since
+    # those would let monitoring preempt inference.
+    assert "lower number indicates a higher priority" in " ".join(doc.split())
 
 
 def test_cuda_event_exposes_record_wait_query_and_timing() -> None:

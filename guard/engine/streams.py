@@ -193,9 +193,11 @@ class MonitorStream:
 
     Args:
         device: device the stream belongs to.
-        priority: CUDA stream priority; ``0`` (the default) is the *lowest* priority the
-            device offers, which is what the monitor wants. Negative values raise the
-            monitor above inference and will hurt serving latency — don't.
+        priority: CUDA stream priority. ``0`` is torch's default and the least priority on
+            current hardware, which is what the monitor wants; torch clamps out-of-range
+            values, mapping large positive numbers to the least priority available.
+            Negative values raise the monitor *above* inference and will hurt serving
+            latency — those are rejected outright.
     """
 
     __slots__ = ("_priority", "_stream", "device")
